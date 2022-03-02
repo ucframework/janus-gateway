@@ -318,6 +318,16 @@ events_libadd = \
 	$(EVENTS_LIBS) \
 	$(NULL)
 
+if ENABLE_UCF_HTTP
+event_LTLIBRARIES += events/libjanus_ucfhttp.la
+events_libjanus_ucfhttp_la_SOURCES = events/janus_ucfhttp.c
+events_libjanus_ucfhttp_la_CFLAGS = $(events_cflags) $(LIBCURL_CFLAGS)
+events_libjanus_ucfhttp_la_LDFLAGS = $(events_ldflags) $(LIBCURL_LDFLAGS) $(LIBCURL_LIBS) -lm
+events_libjanus_ucfhttp_la_LIBADD = $(events_libadd) $(LIBCURL_LIBADD)
+conf_DATA += conf/janus.eventhandler.ucfhttp.jcfg.sample
+EXTRA_DIST += conf/janus.eventhandler.ucfhttp.jcfg.sample
+endif
+
 if ENABLE_SAMPLEEVH
 event_LTLIBRARIES += events/libjanus_sampleevh.la
 events_libjanus_sampleevh_la_SOURCES = events/janus_sampleevh.c
