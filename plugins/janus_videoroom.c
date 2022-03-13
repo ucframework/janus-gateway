@@ -3855,6 +3855,7 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 		json_object_set_new(destroyed, "room", string_ids ? json_string(room_id_str) : json_integer(room_id));
 		GHashTableIter iter;
 		gpointer value;
+		janus_mutex_unlock(&rooms_mutex);
 		janus_mutex_lock(&videoroom->mutex);
 		g_hash_table_iter_init(&iter, videoroom->participants);
 		while (g_hash_table_iter_next(&iter, NULL, &value)) {
@@ -3877,7 +3878,6 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 			json_object_set_new(info, "room", string_ids ? json_string(room_id_str) : json_integer(room_id));
 			gateway->notify_event(&janus_videoroom_plugin, session ? session->handle : NULL, info);
 		}
-		janus_mutex_unlock(&rooms_mutex);
 		if(save) {
 			/* This change is permanent: save to the configuration file too
 			 * FIXME: We should check if anything fails... */
