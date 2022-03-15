@@ -2804,12 +2804,11 @@ static void janus_videoroom_leave_or_unpublish(janus_videoroom_publisher *partic
 	janus_refcount_decrease(&room->ref);
 	json_decref(event);
 }
-
-static int janus_videoroom_kick_participant(janus_videoroom *videoroom, guint64 user_id, char *user_id_str, char *room_id_str, json_t *response, char *error_cause)
+// Helper function to kick a participant from videoroom
+// Note: a ref to videoroom must exist prior to calling this function
+static int janus_videoroom_kick_participant_internal(janus_videoroom *videoroom, guint64 user_id, char *user_id_str, char *room_id_str, json_t *response, char *error_cause)
 {
 	int error_code = 0;
-	
-    janus_refcount_increase(&videoroom->ref);
     janus_mutex_lock(&videoroom->mutex);
     janus_videoroom_publisher *participant = g_hash_table_lookup(videoroom->participants,
         string_ids ? (gpointer)user_id_str : (gpointer)&user_id);
@@ -2876,7 +2875,6 @@ static int janus_videoroom_kick_participant(janus_videoroom *videoroom, guint64 
     response = json_object();
     json_object_set_new(response, "videoroom", json_string("success"));
     /* Done */
-    janus_refcount_decrease(&videoroom->ref);
     janus_refcount_decrease(&participant->ref);
 	return error_code;
 }
@@ -4661,8 +4659,6 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 		// Also remove it from the allowed list
 		g_hash_table_remove(videoroom->allowed, (char *)json_string_value(token));
 		janus_mutex_unlock(&videoroom->mutex);
-		janus_refcount_decrease(&videoroom->ref);
-
 		for(GList *i = potencialSubscribers; i; i = i->next) {
 			janus_videoroom_publisher *participant = i->data;
 			janus_mutex_lock(&participant->subscribers_mutex);
@@ -4689,10 +4685,11 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 			json_t *resp = NULL;
 			janus_videoroom_publisher *participant = i->data;
 			JANUS_LOG(LOG_INFO, "[kickall] kick participant %"SCNu64 ", %s\n", participant->user_id, participant->user_id_str ? participant->user_id_str : "null");
-			error_code = janus_videoroom_kick_participant(videoroom, participant->user_id, participant->user_id_str, participant->room_id_str, resp, error_cause);
+			error_code = janus_videoroom_kick_participant_internal(videoroom, participant->user_id, participant->user_id_str, participant->room_id_str, resp, error_cause);
 			if (resp) json_decref(resp);
 			janus_refcount_decrease(&participant->ref);
 		}
+		janus_refcount_decrease(&videoroom->ref);
 		g_list_free(participantsLeaving);
 		/* Prepare response */
 		response = json_object();
