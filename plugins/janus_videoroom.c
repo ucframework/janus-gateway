@@ -4646,46 +4646,49 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 		GHashTableIter iter;
 		gpointer key, value;
 		GList *participantsLeaving = NULL;
+		GList *potencialSubscribers = NULL;
 		g_hash_table_iter_init(&iter, videoroom->participants);
 		while (g_hash_table_iter_next (&iter, &key, &value))  {
 			janus_videoroom_publisher *participant = value;
-			gboolean participantShouldDecrease = TRUE;
+			
 			janus_refcount_increase(&participant->ref);
 			if (strcmp(participant->token_str, (char *)json_string_value(token)) != 0) {
-				janus_mutex_lock(&participant->subscribers_mutex);
-				/* Iterate on the subscriptions we know this user has */
-				GSList *s = participant->subscribers;
-				while(s) {
-					janus_videoroom_subscriber *subscriber = (janus_videoroom_subscriber *)s->data;
-					if(subscriber && subscriber->token_str && !strcmp(subscriber->token_str, (char *)json_string_value(token))) {
-						if(!subscriber->kicked) {
-							JANUS_LOG(LOG_INFO, "[kickall] Kicked subscriber by token %s from room %s\n", subscriber->token_str, room_id_str);
-							g_atomic_int_set(&subscriber->session->started, 0);
-							subscriber->kicked = TRUE;
-							subscriber->audio = FALSE;
-							subscriber->video = FALSE;
-							subscriber->data = FALSE;
-						}
-					}
-					s = s->next;
-				}
-				janus_mutex_unlock(&participant->subscribers_mutex);
+				potencialSubscribers = g_list_append(potencialSubscribers, participant); 
 			} else if (strcmp(participant->token_str, (char *)json_string_value(token)) == 0 && !participant->kicked) {
 				participantsLeaving = g_list_append(participantsLeaving, participant);
-				participantShouldDecrease = FALSE;
 			}
-			if (participantShouldDecrease)
-				janus_refcount_decrease(&participant->ref);
 		}
 		// Also remove it from the allowed list
 		g_hash_table_remove(videoroom->allowed, (char *)json_string_value(token));
 		janus_mutex_unlock(&videoroom->mutex);
 		janus_refcount_decrease(&videoroom->ref);
-		
+
+		for(GList *i = potencialSubscribers; i; i = i->next) {
+			janus_videoroom_publisher *participant = i->data;
+			janus_mutex_lock(&participant->subscribers_mutex);
+			/* Iterate on the subscriptions we know this user has */
+			GSList *s = participant->subscribers;
+			while(s) {
+				janus_videoroom_subscriber *subscriber = (janus_videoroom_subscriber *)s->data;
+				if(subscriber && subscriber->token_str && !strcmp(subscriber->token_str, (char *)json_string_value(token))) {
+					if(!subscriber->kicked) {
+						JANUS_LOG(LOG_INFO, "[kickall] Kicked subscriber by token %s from room %s\n", subscriber->token_str, room_id_str);
+						g_atomic_int_set(&subscriber->session->started, 0);
+						subscriber->kicked = TRUE;
+						subscriber->audio = FALSE;
+						subscriber->video = FALSE;
+						subscriber->data = FALSE;
+					}
+				}
+				s = s->next;
+			}
+			janus_mutex_unlock(&participant->subscribers_mutex);
+			janus_refcount_decrease(&participant->ref);
+		}
 		for(GList *i = participantsLeaving; i; i = i->next) {
 			json_t *resp = NULL;
 			janus_videoroom_publisher *participant = i->data;
-			JANUS_LOG(LOG_INFO, "kickall participant %"SCNu64 ", %s\n", participant->user_id, participant->user_id_str ? participant->user_id_str : "null");
+			JANUS_LOG(LOG_INFO, "[kickall] kick participant %"SCNu64 ", %s\n", participant->user_id, participant->user_id_str ? participant->user_id_str : "null");
 			error_code = janus_videoroom_kick_participant(videoroom, participant->user_id, participant->user_id_str, participant->room_id_str, resp, error_cause);
 			if (resp) json_decref(resp);
 			janus_refcount_decrease(&participant->ref);
