@@ -2808,13 +2808,12 @@ static void janus_videoroom_leave_or_unpublish(janus_videoroom_publisher *partic
 // Note: a ref to videoroom must exist prior to calling this function
 static int janus_videoroom_kick_participant_internal(janus_videoroom *videoroom, guint64 user_id, char *user_id_str, char *room_id_str, json_t *response, char *error_cause)
 {
-	int error_code = 0;
+    int error_code = 0;
     janus_mutex_lock(&videoroom->mutex);
     janus_videoroom_publisher *participant = g_hash_table_lookup(videoroom->participants,
         string_ids ? (gpointer)user_id_str : (gpointer)&user_id);
     if(participant == NULL) {
         janus_mutex_unlock(&videoroom->mutex);
-        janus_refcount_decrease(&videoroom->ref);
         JANUS_LOG(LOG_ERR, "No such user %s in room %s\n", user_id_str, room_id_str);
         error_code = JANUS_VIDEOROOM_ERROR_NO_SUCH_FEED;
         g_snprintf(error_cause, 512, "No such user %s in room %s", user_id_str, room_id_str);
@@ -2824,7 +2823,6 @@ static int janus_videoroom_kick_participant_internal(janus_videoroom *videoroom,
     if(participant->kicked) {
         /* Already kicked */
         janus_mutex_unlock(&videoroom->mutex);
-        janus_refcount_decrease(&videoroom->ref);
         janus_refcount_decrease(&participant->ref);
         response = json_object();
         json_object_set_new(response, "videoroom", json_string("success"));
@@ -2876,7 +2874,7 @@ static int janus_videoroom_kick_participant_internal(janus_videoroom *videoroom,
     json_object_set_new(response, "videoroom", json_string("success"));
     /* Done */
     janus_refcount_decrease(&participant->ref);
-	return error_code;
+    return error_code;
 }
 
 void janus_videoroom_destroy_session(janus_plugin_session *handle, int *error) {
