@@ -81,7 +81,9 @@
 		"event" : "<name of the error event>",
 		"code" : <SIP error code>,
 		"reason" : "<SIP error reason>",
-		"reason_header" : "<SIP reason header; optional>"
+		"reason_header" : "<Reason header text; optional>",
+		"reason_header_protocol" : "<Reason header protocol; optional>",
+		"reason_header_cause" : "<Reason header cause code; optional>"
 	}
 }
 \endverbatim
@@ -668,7 +670,10 @@
 #include <sofia-sip/nua.h>
 #include <sofia-sip/nua_tag.h>
 #include <sofia-sip/sdp.h>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-prototypes"
 #include <sofia-sip/sip_header.h>
+#pragma GCC diagnostic pop
 #include <sofia-sip/sip_status.h>
 #include <sofia-sip/url.h>
 #include <sofia-sip/tport_tag.h>
@@ -1061,6 +1066,8 @@ typedef struct janus_sip_session {
 	GList *helpers;			/* The helper sessions, if this is the "master" */
 	janus_mutex mutex;
 	char *hangup_reason_header;
+	char *hangup_reason_header_protocol;
+	char *hangup_reason_header_cause;
 	GList *incoming_header_prefixes;
 	GList *active_calls;
 	janus_refcount ref;
@@ -1182,6 +1189,14 @@ static void janus_sip_session_free(const janus_refcount *session_ref) {
 	if(session->hangup_reason_header) {
 		g_free(session->hangup_reason_header);
 		session->hangup_reason_header = NULL;
+	}
+	if(session->hangup_reason_header_protocol) {
+		g_free(session->hangup_reason_header_protocol);
+		session->hangup_reason_header_protocol = NULL;
+	}
+	if(session->hangup_reason_header_cause) {
+		g_free(session->hangup_reason_header_cause);
+		session->hangup_reason_header_cause = NULL;
 	}
 	if(session->incoming_header_prefixes) {
 		g_list_free_full(session->incoming_header_prefixes, g_free);
@@ -1647,11 +1662,17 @@ static void janus_sip_sofia_logger(void *stream, char const *fmt, va_list ap) {
 	if(!fmt)
 		return;
 	char line[255];
+#pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#ifndef __clang__
+#pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsuggest-attribute=format"
+#endif
 	g_vsnprintf(line, sizeof(line), fmt, ap);
-#pragma GCC diagnostic warning "-Wformat-nonliteral"
-#pragma GCC diagnostic warning "-Wsuggest-attribute=format"
+#ifndef __clang__
+#pragma GCC diagnostic pop
+#endif
+#pragma GCC diagnostic pop
 	if(skip) {
 		/* This is a message we're not interested in: just check when it ends */
 		if(line[3] == '-') {
@@ -2101,6 +2122,8 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->callid = NULL;
 	session->sdp = NULL;
 	session->hangup_reason_header = NULL;
+	session->hangup_reason_header_protocol = NULL;
+	session->hangup_reason_header_cause = NULL;
 	session->media.remote_audio_ip = NULL;
 	session->media.remote_video_ip = NULL;
 	session->media.earlymedia = FALSE;
@@ -4235,17 +4258,13 @@ static void *janus_sip_handler(void *data) {
 				/* Craft the Replaces header field */
 				sip_replaces_t *r = nua_handle_make_replaces(replaced->stack->s_nh_i, session->stack->s_home, 0);
 				char *replaces = sip_headers_as_url_query(session->stack->s_home, SIPTAG_REPLACES(r), TAG_END());
-#pragma GCC diagnostic ignored "-Winline"
 				refer_to = sip_refer_to_format(session->stack->s_home, "<%s?%s>", uri_text, replaces);
-#pragma GCC diagnostic warning "-Winline"
 				JANUS_LOG(LOG_VERB, "Attended transfer: <%s?%s>\n", uri_text, replaces);
 				su_free(session->stack->s_home, r);
 				su_free(session->stack->s_home, replaces);
 			}
-#pragma GCC diagnostic ignored "-Winline"
 			if(refer_to == NULL)
 				refer_to = sip_refer_to_format(session->stack->s_home, "<%s>", uri_text);
-#pragma GCC diagnostic warning "-Winline"
 			/* Send the REFER */
 			nua_refer(session->stack->s_nh_i,
 				SIPTAG_REFER_TO(refer_to),
@@ -4812,6 +4831,23 @@ static void *janus_sip_handler(void *data) {
 			/* Notify the result */
 			result = json_object();
 			json_object_set_new(result, "event", json_string("dtmfsent"));
+		} else if(!strcasecmp(request_text, "reset")) {
+			/* Apparently, under some particular circumstances that we haven't
+			 * managed to replicate ourselves yet, it can sometimes happen that
+			 * a janus_sip_session remains with the establishing atomic set to
+			 * 1, even though the last call has been correctly closed. This
+			 * prevents further incoming calls to be established, as the
+			 * plugin automatically answers with a 486 busy thinking another
+			 * call is currently in progress. This "reset" request is here
+			 * to reset the establishing flag back to 0, in case the call
+			 * state is idle but the flag is still set to 1 instead */
+			if(session->status == janus_sip_call_status_idle) {
+				g_atomic_int_set(&session->established, 0);
+				g_atomic_int_set(&session->establishing, 0);
+			}
+			/* Notify the result */
+			result = json_object();
+			json_object_set_new(result, "event", json_string("reset"));
 		} else {
 			JANUS_LOG(LOG_ERR, "Unknown request (%s)\n", request_text);
 			error_code = JANUS_SIP_ERROR_INVALID_REQUEST;
@@ -4938,6 +4974,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				json_object_set_new(calling, "reason", json_string(phrase ? phrase : ""));
 				if(session->hangup_reason_header)
 					json_object_set_new(calling, "reason_header", json_string(session->hangup_reason_header));
+				if(session->hangup_reason_header_protocol)
+					json_object_set_new(calling, "reason_header_protocol", json_string(session->hangup_reason_header_protocol));
+				if(session->hangup_reason_header_cause)
+					json_object_set_new(calling, "reason_header_cause", json_string(session->hangup_reason_header_cause));
 				json_object_set_new(call, "result", calling);
 				json_object_set_new(call, "call_id", json_string(session->callid));
 				int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, call, NULL);
@@ -4954,6 +4994,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 						json_object_set_new(info, "reason", json_string(phrase));
 					if(session->hangup_reason_header)
 						json_object_set_new(info, "reason_header", json_string(session->hangup_reason_header));
+					if(session->hangup_reason_header_protocol)
+						json_object_set_new(info, "reason_header_protocol", json_string(session->hangup_reason_header_protocol));
+					if(session->hangup_reason_header_cause)
+						json_object_set_new(info, "reason_header_cause", json_string(session->hangup_reason_header_cause));
 					gateway->notify_event(&janus_sip_plugin, session->handle, info);
 				}
 				/* Get rid of any PeerConnection that may have been set up */
@@ -4967,7 +5011,11 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				g_free(session->transaction);
 				session->transaction = NULL;
 				g_free(session->hangup_reason_header);
+				g_free(session->hangup_reason_header_protocol);
+				g_free(session->hangup_reason_header_cause);
 				session->hangup_reason_header = NULL;
+				session->hangup_reason_header_protocol = NULL;
+				session->hangup_reason_header_cause = NULL;
 				if(g_atomic_int_get(&session->establishing) || g_atomic_int_get(&session->established))
 					gateway->close_pc(session->handle);
 			} else if(session->stack->s_nh_i == nh && callstate == nua_callstate_calling && session->status == janus_sip_call_status_incall) {
@@ -5004,6 +5052,12 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				session->hangup_reason_header = g_strdup(sip->sip_reason->re_text);
 				janus_sip_remove_quotes(session->hangup_reason_header);
 			}
+			if(sip->sip_reason && sip->sip_reason->re_protocol) {
+				session->hangup_reason_header_protocol = g_strdup(sip->sip_reason->re_protocol);
+			}
+			if(sip->sip_reason && sip->sip_reason->re_cause) {
+				session->hangup_reason_header_cause = g_strdup(sip->sip_reason->re_cause);
+			}
 			break;
 		}
 		case nua_i_cancel: {
@@ -5011,6 +5065,12 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			if(sip->sip_reason && sip->sip_reason->re_text) {
 				session->hangup_reason_header = g_strdup(sip->sip_reason->re_text);
 				janus_sip_remove_quotes(session->hangup_reason_header);
+			}
+			if(sip->sip_reason && sip->sip_reason->re_protocol) {
+				session->hangup_reason_header_protocol = g_strdup(sip->sip_reason->re_protocol);
+			}
+			if(sip->sip_reason && sip->sip_reason->re_cause) {
+				session->hangup_reason_header_cause = g_strdup(sip->sip_reason->re_cause);
 			}
 			break;
 		}

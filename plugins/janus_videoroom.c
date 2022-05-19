@@ -686,6 +686,8 @@ room-<unique room ID>: {
 	"display" : "<new display name to use in the room; optional>",
 	"audio_active_packets" : "<new audio_active_packets to overwrite in the room one; optional>",
 	"audio_level_average" : "<new audio_level_average to overwrite the room one; optional>",
+	"min_delay" : <minimum delay to enforce via the playout-delay RTP extension, in blocks of 10ms; optional>,
+	"max_delay" : <maximum delay to enforce via the playout-delay RTP extension, in blocks of 10ms; optional>,
 }
 \endverbatim
  *
@@ -1089,7 +1091,9 @@ room-<unique room ID>: {
 	"spatial_layer" : <spatial layer to receive (0-2), in case VP9-SVC is enabled; optional>,
 	"temporal_layer" : <temporal layers to receive (0-2), in case VP9-SVC is enabled; optional>,
 	"audio_level_average" : "<if provided, overrides the room audio_level_average for this user; optional>",
-	"audio_active_packets" : "<if provided, overrides the room audio_active_packets for this user; optional>"
+	"audio_active_packets" : "<if provided, overrides the room audio_active_packets for this user; optional>",
+	"min_delay" : <minimum delay to enforce via the playout-delay RTP extension, in blocks of 10ms; optional>,
+	"max_delay" : <maximum delay to enforce via the playout-delay RTP extension, in blocks of 10ms; optional>
 }
 \endverbatim
  *
@@ -1385,6 +1389,9 @@ static struct janus_json_parameter publish_parameters[] = {
 	{"secret", JSON_STRING, 0},
 	{"audio_level_averge", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"audio_active_packets", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	/* For the playout-delay RTP extension, if negotiated */
+	{"min_delay", JSON_INTEGER, 0},
+	{"max_delay", JSON_INTEGER, 0},
 	/* The following are just to force a renegotiation and/or an ICE restart */
 	{"update", JANUS_JSON_BOOL, 0},
 	{"restart", JANUS_JSON_BOOL, 0}
@@ -1434,6 +1441,9 @@ static struct janus_json_parameter configure_parameters[] = {
 	/* For VP9 SVC */
 	{"spatial_layer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"temporal_layer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	/* For the playout-delay RTP extension, if negotiated */
+	{"min_delay", JSON_INTEGER, 0},
+	{"max_delay", JSON_INTEGER, 0},
 	/* The following is to handle a renegotiation */
 	{"update", JANUS_JSON_BOOL, 0}
 };
@@ -1453,6 +1463,9 @@ static struct janus_json_parameter subscriber_parameters[] = {
 	/* For VP9 SVC */
 	{"spatial_layer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"temporal_layer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	/* For the playout-delay RTP extension, if negotiated */
+	{"min_delay", JSON_INTEGER, 0},
+	{"max_delay", JSON_INTEGER, 0},
 };
 
 /* Static configuration instance */
@@ -1464,6 +1477,7 @@ static janus_mutex config_mutex = JANUS_MUTEX_INITIALIZER;
 static volatile gint initialized = 0, stopping = 0;
 static gboolean notify_events = TRUE;
 static gboolean string_ids = FALSE;
+static gboolean ipv6_disabled = FALSE;
 static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static void *janus_videoroom_handler(void *data);
@@ -1664,6 +1678,8 @@ typedef struct janus_videoroom_publisher {
 	int user_audio_active_packets;	/* Participant's audio_active_packets overwriting global room setting */
 	int user_audio_level_average;	/* Participant's audio_level_average overwriting global room setting */
 	gboolean talking; /* Whether this participant is currently talking (uses audio levels extension) */
+	/* Playout delays to enforce when relaying this stream, if the extension has been negotiated */
+	int16_t min_delay, max_delay;
 	gboolean data_active, data_muted;
 	gboolean firefox;	/* We send Firefox users a different kind of FIR */
 	uint32_t bitrate;
@@ -1720,6 +1736,8 @@ typedef struct janus_videoroom_subscriber {
 	int spatial_layer, target_spatial_layer;
 	gint64 last_spatial_layer[3];
 	int temporal_layer, target_temporal_layer;
+	/* Playout delays to enforce when relaying this stream, if the extension has been negotiated */
+	int16_t min_delay, max_delay;
 	gboolean e2ee;		/* If media for this subscriber is end-to-end encrypted */
 	volatile gint destroyed;
 	janus_refcount ref;
@@ -1970,13 +1988,17 @@ static guint32 janus_videoroom_rtp_forwarder_add_helper(janus_videoroom_publishe
 	if(!p || !host) {
 		return 0;
 	}
+	if(ipv6_disabled && strstr(host, ":") != NULL) {
+		JANUS_LOG(LOG_ERR, "Attempt to create an IPv6 forwarder, but IPv6 networking is not available\n");
+		return 0;
+	}
 	janus_refcount_increase(&p->ref);
 	janus_mutex_lock(&p->rtp_forwarders_mutex);
 	/* Do we need to bind to a port for RTCP? */
 	int fd = -1;
 	uint16_t local_rtcp_port = 0;
 	if(!is_data && rtcp_port > 0) {
-		fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+		fd = socket(!ipv6_disabled ? AF_INET6 : AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 		if(fd < 0) {
 			janus_mutex_unlock(&p->rtp_forwarders_mutex);
 			janus_refcount_decrease(&p->ref);
@@ -1984,23 +2006,36 @@ static guint32 janus_videoroom_rtp_forwarder_add_helper(janus_videoroom_publishe
 				errno, g_strerror(errno));
 			return 0;
 		}
-		int v6only = 0;
-		if(setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0) {
-			janus_mutex_unlock(&p->rtp_forwarders_mutex);
-			janus_refcount_decrease(&p->ref);
-			JANUS_LOG(LOG_ERR, "Error creating RTCP socket for new RTP forwarder... %d (%s)\n",
-				errno, g_strerror(errno));
-			close(fd);
-			return 0;
+		struct sockaddr *address = NULL;
+		struct sockaddr_in addr4 = { 0 };
+		struct sockaddr_in6 addr6 = { 0 };
+		socklen_t len = 0;
+		if(!ipv6_disabled) {
+			/* Configure the socket so that it can be used both on IPv4 and IPv6 */
+			int v6only = 0;
+			if(setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0) {
+				janus_mutex_unlock(&p->rtp_forwarders_mutex);
+				janus_refcount_decrease(&p->ref);
+				JANUS_LOG(LOG_ERR, "Error configuring RTCP socket for new RTP forwarder... %d (%s)\n",
+					errno, g_strerror(errno));
+				close(fd);
+				return 0;
+			}
+			len = sizeof(addr6);
+			addr6.sin6_family = AF_INET6;
+			addr6.sin6_port = htons(0);		/* The RTCP port we received is the remote one */
+			addr6.sin6_addr = in6addr_any;
+			address = (struct sockaddr *)&addr6;
+		} else {
+			/* IPv6 is disabled, only do IPv4 */
+			len = sizeof(addr4);
+			addr4.sin_family = AF_INET;
+			addr4.sin_port = htons(0);		/* The RTCP port we received is the remote one */
+			addr4.sin_addr.s_addr = INADDR_ANY;
+			address = (struct sockaddr *)&addr4;
 		}
-		struct sockaddr_in6 address = { 0 };
-		socklen_t len = sizeof(address);
-		memset(&address, 0, sizeof(address));
-		address.sin6_family = AF_INET6;
-		address.sin6_port = htons(0);	/* The RTCP port we received is the remote one */
-		address.sin6_addr = in6addr_any;
-		if(bind(fd, (struct sockaddr *)&address, len) < 0 ||
-				getsockname(fd, (struct sockaddr *)&address, &len) < 0) {
+		if(bind(fd, (struct sockaddr *)address, len) < 0 ||
+				getsockname(fd, (struct sockaddr *)address, &len) < 0) {
 			janus_mutex_unlock(&p->rtp_forwarders_mutex);
 			janus_refcount_decrease(&p->ref);
 			JANUS_LOG(LOG_ERR, "Error binding RTCP socket for new RTP forwarder... %d (%s)\n",
@@ -2008,7 +2043,7 @@ static guint32 janus_videoroom_rtp_forwarder_add_helper(janus_videoroom_publishe
 			close(fd);
 			return 0;
 		}
-		local_rtcp_port = ntohs(address.sin6_port);
+		local_rtcp_port = ntohs(!ipv6_disabled ? addr6.sin6_port : addr4.sin_port);
 		JANUS_LOG(LOG_VERB, "Bound local %s RTCP port: %"SCNu16"\n",
 			is_video ? "video" : "audio", local_rtcp_port);
 	}
@@ -2565,6 +2600,22 @@ int janus_videoroom_init(janus_callbacks *callback, const char *config_path) {
 		JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the VideoRoom RTCP thread for RTP forwarders...\n",
 			error->code, error->message ? error->message : "??");
 		g_error_free(error);
+	}
+
+	/* Finally, let's check if IPv6 is disabled, as we may need to know for forwarders */
+	int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+	if(fd <= 0) {
+		ipv6_disabled = TRUE;
+	} else {
+		int v6only = 0;
+		if(setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0)
+			ipv6_disabled = TRUE;
+	}
+	if(fd > 0)
+		close(fd);
+	ipv6_disabled = TRUE;
+	if(ipv6_disabled) {
+		JANUS_LOG(LOG_WARN, "IPv6 disabled, will only create VideoRoom forwarders to IPv4 addresses\n");
 	}
 
 	g_atomic_int_set(&initialized, 1);
@@ -4187,14 +4238,15 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 		}
 		janus_refcount_increase(&publisher->ref);	/* This is just to handle the request for now */
 		if(publisher->udp_sock <= 0) {
-			publisher->udp_sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+			publisher->udp_sock = socket(!ipv6_disabled ? AF_INET6 : AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 			int v6only = 0;
 			if(publisher->udp_sock <= 0 ||
-					setsockopt(publisher->udp_sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0) {
+					(!ipv6_disabled && setsockopt(publisher->udp_sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0)) {
 				janus_refcount_decrease(&publisher->ref);
 				janus_mutex_unlock(&videoroom->mutex);
 				janus_refcount_decrease(&videoroom->ref);
-				JANUS_LOG(LOG_ERR, "Could not open UDP socket for RTP stream for publisher (%s)\n", publisher_id_str);
+				JANUS_LOG(LOG_ERR, "Could not open UDP socket for RTP stream for publisher (%s), %d (%s)\n",
+					publisher_id_str, errno, g_strerror(errno));
 				error_code = JANUS_VIDEOROOM_ERROR_UNKNOWN_ERROR;
 				g_snprintf(error_cause, 512, "Could not open UDP socket for RTP stream");
 				goto prepare_response;
@@ -5703,6 +5755,10 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 		/* Backup the actual timestamp and sequence number set by the publisher, in case switching is involved */
 		packet.timestamp = ntohl(packet.data->timestamp);
 		packet.seq_number = ntohs(packet.data->seq_number);
+		if(participant->min_delay > -1 && participant->max_delay > -1) {
+			packet.extensions.min_delay = participant->min_delay;
+			packet.extensions.max_delay = participant->max_delay;
+		}
 		/* Go: some viewers may decide to drop the packet, but that's up to them */
 		janus_mutex_lock_nodebug(&participant->subscribers_mutex);
 		g_slist_foreach(participant->subscribers, janus_videoroom_relay_rtp_packet, &packet);
@@ -6470,6 +6526,8 @@ static void *janus_videoroom_handler(void *data) {
 				publisher->audio_level_extmap_id = 0;
 				publisher->video_orient_extmap_id = 0;
 				publisher->playout_delay_extmap_id = 0;
+				publisher->min_delay = -1;	/* We'll deal with this later */
+				publisher->max_delay = -1;	/* We'll deal with this later */
 				publisher->remb_startup = 4;
 				publisher->remb_latest = 0;
 				publisher->fir_latest = 0;
@@ -6767,6 +6825,8 @@ static void *janus_videoroom_handler(void *data) {
 					goto error;
 				}
 				json_t *sc_fallback = json_object_get(root, "fallback");
+				json_t *min_delay = json_object_get(root, "min_delay");
+				json_t *max_delay = json_object_get(root, "max_delay");
 				janus_videoroom_publisher *owner = NULL;
 				janus_videoroom_publisher *publisher = g_hash_table_lookup(videoroom->participants,
 					string_ids ? (gpointer)feed_id_str : (gpointer)&feed_id);
@@ -6869,6 +6929,31 @@ static void *janus_videoroom_handler(void *data) {
 						subscriber->temporal_layer = -1;
 						subscriber->target_temporal_layer = temporal ? json_integer_value(temporal) : 2;
 					}
+					/* Override the playout-delay properties */
+					subscriber->min_delay = -1;
+					subscriber->max_delay = -1;
+					if(min_delay) {
+						int16_t md = json_integer_value(min_delay);
+						if(md < 0) {
+							subscriber->min_delay = -1;
+							subscriber->max_delay = -1;
+						} else {
+							subscriber->min_delay = md;
+							if(subscriber->min_delay > subscriber->max_delay)
+								subscriber->max_delay = subscriber->min_delay;
+						}
+					}
+					if(max_delay) {
+						int16_t md = json_integer_value(max_delay);
+						if(md < 0) {
+							subscriber->min_delay = -1;
+							subscriber->max_delay = -1;
+						} else {
+							subscriber->max_delay = md;
+							if(subscriber->max_delay < subscriber->min_delay)
+								subscriber->min_delay = subscriber->max_delay;
+						}
+					}
 					session->participant = subscriber;
 					janus_mutex_lock(&publisher->subscribers_mutex);
 					publisher->subscribers = g_slist_append(publisher->subscribers, subscriber);
@@ -6960,9 +7045,15 @@ static void *janus_videoroom_handler(void *data) {
 			}
 			if(participant->room == NULL) {
 				janus_refcount_decrease(&participant->ref);
-				JANUS_LOG(LOG_ERR, "No such room\n");
-				error_code = JANUS_VIDEOROOM_ERROR_NO_SUCH_ROOM;
-				g_snprintf(error_cause, 512, "No such room");
+				if(!strcasecmp(request_text, "join") || !strcasecmp(request_text, "joinandconfigure")) {
+					JANUS_LOG(LOG_ERR, "Not in a room (create a new handle)\n");
+					error_code = JANUS_VIDEOROOM_ERROR_ALREADY_JOINED;
+					g_snprintf(error_cause, 512, "Not in a room (create a new handle)");
+				} else {
+					JANUS_LOG(LOG_ERR, "No such room\n");
+					error_code = JANUS_VIDEOROOM_ERROR_NO_SUCH_ROOM;
+					g_snprintf(error_cause, 512, "No such room");
+				}
 				goto error;
 			}
 			if(!strcasecmp(request_text, "join") || !strcasecmp(request_text, "joinandconfigure")) {
@@ -7007,6 +7098,8 @@ static void *janus_videoroom_handler(void *data) {
 				json_t *update = json_object_get(root, "update");
 				json_t *user_audio_active_packets = json_object_get(root, "audio_active_packets");
 				json_t *user_audio_level_average = json_object_get(root, "audio_level_average");
+				json_t *min_delay = json_object_get(root, "min_delay");
+				json_t *max_delay = json_object_get(root, "max_delay");
 				if(audio) {
 					gboolean audio_active = json_is_true(audio);
 					if(g_atomic_int_get(&session->started) && audio_active && !participant->audio_active && !participant->audio_muted) {
@@ -7119,6 +7212,29 @@ static void *janus_videoroom_handler(void *data) {
 					if(error_code != 0) {
 						/* Wrong secret provided, we'll prevent the recording state from being changed */
 						record_locked = TRUE;
+					}
+				}
+				/* Override the playout-delay properties */
+				if(min_delay) {
+					int16_t md = json_integer_value(min_delay);
+					if(md < 0) {
+						participant->min_delay = -1;
+						participant->max_delay = -1;
+					} else {
+						participant->min_delay = md;
+						if(participant->min_delay > participant->max_delay)
+							participant->max_delay = participant->min_delay;
+					}
+				}
+				if(max_delay) {
+					int16_t md = json_integer_value(max_delay);
+					if(md < 0) {
+						participant->min_delay = -1;
+						participant->max_delay = -1;
+					} else {
+						participant->max_delay = md;
+						if(participant->max_delay < participant->min_delay)
+							participant->min_delay = participant->max_delay;
 					}
 				}
 				janus_mutex_lock(&participant->rec_mutex);
@@ -7307,6 +7423,8 @@ static void *janus_videoroom_handler(void *data) {
 					goto error;
 				}
 				json_t *sc_fallback = json_object_get(root, "fallback");
+				json_t *min_delay = json_object_get(root, "min_delay");
+				json_t *max_delay = json_object_get(root, "max_delay");
 				/* Update the audio/video/data flags, if set */
 				janus_videoroom_publisher *publisher = subscriber->feed;
 				if(publisher) {
@@ -7414,6 +7532,29 @@ static void *janus_videoroom_handler(void *data) {
 							json_decref(event);
 						}
 						subscriber->target_temporal_layer = temporal_layer;
+					}
+				}
+				/* Override the playout-delay properties */
+				if(min_delay) {
+					int16_t md = json_integer_value(min_delay);
+					if(md < 0) {
+						subscriber->min_delay = -1;
+						subscriber->max_delay = -1;
+					} else {
+						subscriber->min_delay = md;
+						if(subscriber->min_delay > subscriber->max_delay)
+							subscriber->max_delay = subscriber->min_delay;
+					}
+				}
+				if(max_delay) {
+					int16_t md = json_integer_value(max_delay);
+					if(md < 0) {
+						subscriber->min_delay = -1;
+						subscriber->max_delay = -1;
+					} else {
+						subscriber->max_delay = md;
+						if(subscriber->max_delay < subscriber->min_delay)
+							subscriber->min_delay = subscriber->max_delay;
 					}
 				}
 				event = json_object();
@@ -7582,6 +7723,8 @@ static void *janus_videoroom_handler(void *data) {
 					goto error;
 				}
 				json_t *sc_fallback = json_object_get(root, "fallback");
+				json_t *min_delay = json_object_get(root, "min_delay");
+				json_t *max_delay = json_object_get(root, "max_delay");
 				if(!subscriber->room) {
 					JANUS_LOG(LOG_ERR, "Room Destroyed\n");
 					error_code = JANUS_VIDEOROOM_ERROR_NO_SUCH_ROOM;
@@ -7663,6 +7806,29 @@ static void *janus_videoroom_handler(void *data) {
 					subscriber->last_spatial_layer[2] = 0;
 					subscriber->temporal_layer = -1;
 					subscriber->target_temporal_layer = temporal ? json_integer_value(temporal) : 2;
+				}
+				/* Override the playout-delay properties */
+				if(min_delay) {
+					int16_t md = json_integer_value(min_delay);
+					if(md < 0) {
+						subscriber->min_delay = -1;
+						subscriber->max_delay = -1;
+					} else {
+						subscriber->min_delay = md;
+						if(subscriber->min_delay > subscriber->max_delay)
+							subscriber->max_delay = subscriber->min_delay;
+					}
+				}
+				if(max_delay) {
+					int16_t md = json_integer_value(max_delay);
+					if(md < 0) {
+						subscriber->min_delay = -1;
+						subscriber->max_delay = -1;
+					} else {
+						subscriber->max_delay = md;
+						if(subscriber->max_delay < subscriber->min_delay)
+							subscriber->min_delay = subscriber->max_delay;
+					}
 				}
 				janus_mutex_lock(&publisher->subscribers_mutex);
 				publisher->subscribers = g_slist_append(publisher->subscribers, subscriber);
@@ -8342,6 +8508,10 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 			if(gateway != NULL) {
 				janus_plugin_rtp rtp = { .video = packet->is_video, .buffer = (char *)packet->data, .length = packet->length,
 					.extensions = packet->extensions };
+				if(subscriber->min_delay > -1 && subscriber->max_delay > -1) {
+					rtp.extensions.min_delay = subscriber->min_delay;
+					rtp.extensions.max_delay = subscriber->max_delay;
+				}
 				gateway->relay_rtp(session->handle, &rtp);
 			}
 			if(override_mark_bit && !has_marker_bit) {
@@ -8407,6 +8577,10 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 			if(gateway != NULL) {
 				janus_plugin_rtp rtp = { .video = packet->is_video, .buffer = (char *)packet->data, .length = packet->length,
 					.extensions = packet->extensions };
+				if(subscriber->min_delay > -1 && subscriber->max_delay > -1) {
+					rtp.extensions.min_delay = subscriber->min_delay;
+					rtp.extensions.max_delay = subscriber->max_delay;
+				}
 				gateway->relay_rtp(session->handle, &rtp);
 			}
 			/* Restore the timestamp and sequence number to what the publisher set them to */
@@ -8423,6 +8597,10 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 			if(gateway != NULL) {
 				janus_plugin_rtp rtp = { .video = packet->is_video, .buffer = (char *)packet->data, .length = packet->length,
 					.extensions = packet->extensions };
+				if(subscriber->min_delay > -1 && subscriber->max_delay > -1) {
+					rtp.extensions.min_delay = subscriber->min_delay;
+					rtp.extensions.max_delay = subscriber->max_delay;
+				}
 				gateway->relay_rtp(session->handle, &rtp);
 			}
 			/* Restore the timestamp and sequence number to what the publisher set them to */

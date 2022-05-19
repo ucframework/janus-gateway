@@ -2511,6 +2511,7 @@ static void janus_ice_cb_nice_recv(NiceAgent *agent, guint stream_id, guint comp
 							JANUS_LOG(LOG_VERB, "[%"SCNu64"] Unadvertized SSRC (%"SCNu32") is video! (mid %s)\n", handle->handle_id, packet_ssrc, sdes_item);
 							video = 1;
 							/* Check if simulcasting is involved */
+							janus_mutex_lock(&handle->mutex);
 							if(stream->rid[0] == NULL || stream->rid_ext_id < 1) {
 								stream->video_ssrc_peer[0] = packet_ssrc;
 								found = TRUE;
@@ -2561,6 +2562,7 @@ static void janus_ice_cb_nice_recv(NiceAgent *agent, guint stream_id, guint comp
 									}
 								}
 							}
+							janus_mutex_unlock(&handle->mutex);
 						}
 					}
 				}
@@ -2762,7 +2764,7 @@ static void janus_ice_cb_nice_recv(NiceAgent *agent, guint stream_id, guint comp
 				janus_plugin_rtp rtp = { .video = video, .buffer = buf, .length = buflen };
 				janus_plugin_rtp_extensions_reset(&rtp.extensions);
 				/* Parse RTP extensions before involving the plugin */
-				if(stream->audiolevel_ext_id != -1) {
+				if(!video && stream->audiolevel_ext_id != -1) {
 					gboolean vad = FALSE;
 					int level = -1;
 					if(janus_rtp_header_extension_parse_audio_level(buf, buflen,
@@ -2771,7 +2773,7 @@ static void janus_ice_cb_nice_recv(NiceAgent *agent, guint stream_id, guint comp
 						rtp.extensions.audio_level_vad = vad;
 					}
 				}
-				if(stream->videoorientation_ext_id != -1) {
+				if(video && stream->videoorientation_ext_id != -1) {
 					gboolean c = FALSE, f = FALSE, r1 = FALSE, r0 = FALSE;
 					if(janus_rtp_header_extension_parse_video_orientation(buf, buflen,
 							stream->videoorientation_ext_id, &c, &f, &r1, &r0) == 0) {
@@ -2786,7 +2788,15 @@ static void janus_ice_cb_nice_recv(NiceAgent *agent, guint stream_id, guint comp
 						rtp.extensions.video_flipped = f;
 					}
 				}
-				if(stream->dependencydesc_ext_id != -1) {
+				if(video && stream->playoutdelay_ext_id != -1) {
+					uint16_t min = 0, max = 0;
+					if(janus_rtp_header_extension_parse_playout_delay(buf, buflen,
+							stream->playoutdelay_ext_id, &min, &max) == 0) {
+						rtp.extensions.min_delay = min;
+						rtp.extensions.max_delay = max;
+					}
+				}
+				if(video && stream->dependencydesc_ext_id != -1) {
 					uint8_t dd[256];
 					int len = sizeof(dd);
 					if(janus_rtp_header_extension_parse_dependency_desc(buf, buflen,
@@ -3980,15 +3990,17 @@ static void janus_ice_rtp_extension_update(janus_ice_handle *handle, janus_ice_q
 		totlen += plen;
 	/* We need to strip extensions, here, and add those that need to be there manually */
 	uint16_t extlen = 0;
-	char extensions[200];
+	char extensions[300];
+	uint16_t extbufsize = sizeof(extensions);
 	janus_rtp_header *header = (janus_rtp_header *)packet->data;
 	header->extension = 0;
 	/* Add core and plugin extensions, if any */
 	gboolean video = (packet->type == JANUS_ICE_PACKET_VIDEO);
 	if(handle->stream->mid_ext_id > 0 || (video && handle->stream->abs_send_time_ext_id > 0) ||
 			(video && handle->stream->transport_wide_cc_ext_id > 0) ||
-			(!video && packet->extensions.audio_level != -1 && handle->stream->audiolevel_ext_id > 0) ||
-			(video && packet->extensions.video_rotation != -1 && handle->stream->videoorientation_ext_id > 0) ||
+			(!video && packet->extensions.audio_level > -1 && handle->stream->audiolevel_ext_id > 0) ||
+			(video && packet->extensions.video_rotation > -1 && handle->stream->videoorientation_ext_id > 0) ||
+ 			(video && (packet->extensions.min_delay > -1 || packet->extensions.max_delay > -1) && handle->stream->playoutdelay_ext_id > 0) ||
 			(video && packet->extensions.dd_len > 0 && handle->stream->dependencydesc_ext_id > 0)) {
 		/* Do we need 2-byte extemsions, or are 1-byte extensions fine? */
 		gboolean use_2byte = (video && packet->extensions.dd_len > 16 && handle->stream->dependencydesc_ext_id > 0);
@@ -4000,6 +4012,7 @@ static void janus_ice_rtp_extension_update(janus_ice_handle *handle, janus_ice_q
 		extheader->length = 0;
 		/* Iterate on all extensions we need */
 		char *index = extensions + 4;
+		extbufsize -= 4;
 		/* Check if we need to add the abs-send-time extension */
 		if(video && handle->stream->abs_send_time_ext_id > 0) {
 			int64_t now = (((janus_get_monotonic_time()/1000) << 18) + 500) / 1000;
@@ -4010,12 +4023,14 @@ static void janus_ice_rtp_extension_update(janus_ice_handle *handle, janus_ice_q
 				memcpy(index+1, &abs24, 3);
 				index += 4;
 				extlen += 4;
+				extbufsize -= 4;
 			} else {
 				*index = handle->stream->abs_send_time_ext_id;
 				*(index+1) = 3;
 				memcpy(index+2, &abs24, 3);
 				index += 5;
 				extlen += 5;
+				extbufsize -= 5;
 			}
 		}
 		/* Check if we need to add the transport-wide CC extension */
@@ -4027,51 +4042,35 @@ static void janus_ice_rtp_extension_update(janus_ice_handle *handle, janus_ice_q
 				memcpy(index+1, &transSeqNum, 2);
 				index += 3;
 				extlen += 3;
+				extbufsize -= 3;
 			} else {
 				*index = handle->stream->transport_wide_cc_ext_id;
 				*(index+1) = 2;
 				memcpy(index+2, &transSeqNum, 2);
 				index += 4;
 				extlen += 4;
-			}
-		}
-		/* Check if we need to add the mid extension */
-		if(handle->stream->mid_ext_id > 0) {
-			char *mid = video ? handle->video_mid : handle->audio_mid;
-			if(mid != NULL) {
-				if(!use_2byte) {
-					size_t midlen = strlen(mid) & 0x0F;
-					*index = (handle->stream->mid_ext_id << 4) + (midlen ? midlen-1 : 0);
-					memcpy(index+1, mid, midlen);
-					index += (midlen + 1);
-					extlen += (midlen + 1);
-				} else {
-					size_t midlen = strlen(mid);
-					*index = handle->stream->mid_ext_id;
-					*(index+1) = midlen;
-					memcpy(index+2, mid, midlen);
-					index += (midlen + 2);
-					extlen += (midlen + 2);
-				}
+				extbufsize -= 4;
 			}
 		}
 		/* Check if the plugin (or source) included other extensions */
-		if(!video && packet->extensions.audio_level != -1 && handle->stream->audiolevel_ext_id > 0) {
+		if(!video && packet->extensions.audio_level > -1 && handle->stream->audiolevel_ext_id > 0) {
 			/* Add audio-level extension */
 			if(!use_2byte) {
 				*index = (handle->stream->audiolevel_ext_id << 4);
 				*(index+1) = (packet->extensions.audio_level_vad << 7) + (packet->extensions.audio_level & 0x7F);
 				index += 2;
 				extlen += 2;
+				extbufsize -= 2;
 			} else {
 				*index = handle->stream->audiolevel_ext_id;
 				*(index+1) = 1;
 				*(index+2) = (packet->extensions.audio_level_vad << 7) + (packet->extensions.audio_level & 0x7F);
 				index += 3;
 				extlen += 3;
+				extbufsize -= 3;
 			}
 		}
-		if(video && packet->extensions.video_rotation != -1 && handle->stream->videoorientation_ext_id > 0) {
+		if(video && packet->extensions.video_rotation > -1 && handle->stream->videoorientation_ext_id > 0) {
 			/* Add video-orientation extension */
 			gboolean c = (packet->extensions.video_back_camera == TRUE),
 				f = (packet->extensions.video_flipped == TRUE), r1 = FALSE, r0 = FALSE;
@@ -4099,28 +4098,87 @@ static void janus_ice_rtp_extension_update(janus_ice_handle *handle, janus_ice_q
 				*(index+1) = (c<<3) + (f<<2) + (r1<<1) + r0;
 				index += 2;
 				extlen += 2;
+				extbufsize -= 2;
 			} else {
 				*index = handle->stream->videoorientation_ext_id;
 				*(index+1) = 1;
 				*(index+2) = (c<<3) + (f<<2) + (r1<<1) + r0;
 				index += 3;
 				extlen += 3;
+				extbufsize -= 3;
+			}
+		}
+		if(video && (packet->extensions.min_delay > -1 || packet->extensions.max_delay > -1) && handle->stream->playoutdelay_ext_id > 0) {
+			/* Add playout-delay extension */
+			uint32_t min_delay = (uint32_t)packet->extensions.min_delay;
+			uint32_t max_delay = (uint32_t)packet->extensions.max_delay;
+			uint32_t pd = ((min_delay << 12) & 0x00FFF000) + (max_delay & 0x00000FFF);
+			uint32_t pd24 = htonl(pd) >> 8;
+			if(!use_2byte) {
+				*index = (handle->stream->playoutdelay_ext_id << 4) + 2;
+				memcpy(index+1, &pd24, 3);
+				index += 4;
+				extlen += 4;
+				extbufsize -= 4;
+			} else {
+				*index = handle->stream->playoutdelay_ext_id;
+				*(index+1) = 3;
+				memcpy(index+2, &pd24, 3);
+				index += 5;
+				extlen += 5;
+				extbufsize -= 5;
+			}
+		}
+		/* Check if we need to add the mid extension */
+		if(handle->stream->mid_ext_id > 0) {
+			char *mid = video ? handle->video_mid : handle->audio_mid;
+			if(mid != NULL) {
+				if(!use_2byte) {
+					size_t midlen = strlen(mid) & 0x0F;
+					if(extbufsize < (midlen + 1)) {
+						JANUS_LOG(LOG_WARN, "[%"SCNu64"] Not enough room for mid extension, skipping it...\n", handle->handle_id);
+					} else {
+						*index = (handle->stream->mid_ext_id << 4) + (midlen ? midlen-1 : 0);
+						memcpy(index+1, mid, midlen);
+						index += (midlen + 1);
+						extlen += (midlen + 1);
+						extbufsize -= (midlen + 1);
+					}
+				} else {
+					size_t midlen = strlen(mid);
+					if(extbufsize < (midlen + 2)) {
+						JANUS_LOG(LOG_WARN, "[%"SCNu64"] Not enough room for mid extension, skipping it...\n", handle->handle_id);
+					} else {
+						*index = handle->stream->mid_ext_id;
+						*(index+1) = midlen;
+						memcpy(index+2, mid, midlen);
+						index += (midlen + 2);
+						extlen += (midlen + 2);
+						extbufsize -= (midlen + 2);
+					}
+				}
 			}
 		}
 		if(video && packet->extensions.dd_len > 0 && handle->stream->dependencydesc_ext_id > 0) {
 			/* Add dependency descriptor extension */
-			if(!use_2byte) {
-				*index = (handle->stream->dependencydesc_ext_id << 4) + (packet->extensions.dd_len-1);
-				index++;
-				memcpy(index, packet->extensions.dd_content, packet->extensions.dd_len);
-				index += packet->extensions.dd_len;
-				extlen += packet->extensions.dd_len + 1;
+			if(extbufsize < (packet->extensions.dd_len + (use_2byte ? 2 : 1))) {
+				JANUS_LOG(LOG_WARN, "[%"SCNu64"] Not enough room for dependency-descriptor extension, skipping it...\n", handle->handle_id);
 			} else {
-				*index = handle->stream->dependencydesc_ext_id;
-				*(index+1) = packet->extensions.dd_len;
-				memcpy(index+2, packet->extensions.dd_content, packet->extensions.dd_len);
-				index += packet->extensions.dd_len + 2;
-				extlen += packet->extensions.dd_len + 2;
+				if(!use_2byte) {
+					*index = (handle->stream->dependencydesc_ext_id << 4) + (packet->extensions.dd_len-1);
+					index++;
+					memcpy(index, packet->extensions.dd_content, packet->extensions.dd_len);
+					index += packet->extensions.dd_len;
+					extlen += packet->extensions.dd_len + 1;
+					extbufsize -= packet->extensions.dd_len + 1;
+				} else {
+					*index = handle->stream->dependencydesc_ext_id;
+					*(index+1) = packet->extensions.dd_len;
+					memcpy(index+2, packet->extensions.dd_content, packet->extensions.dd_len);
+					index += packet->extensions.dd_len + 2;
+					extlen += packet->extensions.dd_len + 2;
+					extbufsize -= packet->extensions.dd_len + 2;
+				}
 			}
 		}
 		/* Calculate the whole length */
@@ -4136,13 +4194,13 @@ static void janus_ice_rtp_extension_update(janus_ice_handle *handle, janus_ice_q
 	uint16_t payload_start = payload ? (payload - packet->data) : 0;
 	if(packet->length < totlen)
 		packet->data = g_realloc(packet->data, totlen + SRTP_MAX_TAG_LEN);
-	/* Copy RTP extensions, if any */
+	/* Now check if we need to move the payload */
+	payload = payload_start ? (packet->data + payload_start) : NULL;
+	if(payload != NULL && plen > 0 && packet->length != totlen)
+		memmove(packet->data + RTP_HEADER_SIZE + extlen, payload, plen);
+	/* Finally, copy RTP extensions, if any */
 	if(extlen > 0) {
-		/* Check if we need to move the payload first */
-		payload = payload_start ? (packet->data + payload_start) : NULL;
-		if(payload != NULL && plen > 0 && packet->length != totlen)
-			memmove(packet->data + RTP_HEADER_SIZE + extlen, payload, plen);
-		/* Now copy the extensions after the RTP header */
+		/* Copy the extensions after the RTP header */
 		memcpy(packet->data + RTP_HEADER_SIZE, extensions, extlen);
 	}
 	packet->length = totlen;
@@ -4155,6 +4213,19 @@ static gboolean janus_ice_outgoing_transport_wide_cc_feedback(gpointer user_data
 	janus_ice_handle *handle = (janus_ice_handle *)user_data;
 	janus_ice_stream *stream = handle->stream;
 	if(stream && stream->video_recv && stream->do_transport_wide_cc) {
+		/* Make sure we have an SSRC to report about */
+		guint ssrc_peer = 0;
+		int i = 0;
+		for(i=0; i<3; i++) {
+			if(stream->video_ssrc_peer[i] != 0) {
+				ssrc_peer = stream->video_ssrc_peer[i];
+				break;
+			}
+		}
+		if(ssrc_peer == 0) {
+			JANUS_LOG(LOG_HUGE, "No valid peer SSRC found for transport-wide CC feedback\n");
+			return G_SOURCE_CONTINUE;
+		}
 		/* Create a transport wide feedback message */
 		size_t size = 1300;
 		char rtcpbuf[1300];
@@ -4223,7 +4294,7 @@ static gboolean janus_ice_outgoing_transport_wide_cc_feedback(gpointer user_data
 			guint8 feedback_packet_count = stream->transport_wide_cc_feedback_count++;
 			/* Create RTCP packet */
 			int len = janus_rtcp_transport_wide_cc_feedback(rtcpbuf, size,
-				stream->video_ssrc, stream->video_ssrc_peer[0], feedback_packet_count, packets_to_process);
+				stream->video_ssrc, ssrc_peer, feedback_packet_count, packets_to_process);
 			/* Enqueue it, we'll send it later */
 			if(len > 0) {
 				janus_plugin_rtcp rtcp = { .video = TRUE, .buffer = rtcpbuf, .length = len };

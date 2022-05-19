@@ -413,6 +413,7 @@ int janus_get_codec_pt(const char *sdp, const char *codec) {
 			if(strstr(line, "a=rtpmap") && strstr(line, format)) {
 				/* Gotcha! */
 				int pt = 0;
+#pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
 				if(sscanf(line, rtpmap, &pt) == 1) {
 					*next = '\n';
@@ -422,7 +423,7 @@ int janus_get_codec_pt(const char *sdp, const char *codec) {
 				/* Gotcha! */
 				int pt = 0;
 				if(sscanf(line, rtpmap2, &pt) == 1) {
-#pragma GCC diagnostic warning "-Wformat-nonliteral"
+#pragma GCC diagnostic pop
 					*next = '\n';
 					return pt;
 				}
@@ -894,8 +895,9 @@ gboolean janus_h265_is_keyframe(const char *buffer, int len) {
 	memcpy(&unit, buffer, sizeof(uint16_t));
 	unit = ntohs(unit);
 	uint8_t type = (unit & 0x7E00) >> 9;
-	if(type == 32 || type == 33) {
-		/* FIXME We return TRUE for VPS and SPS */
+	if(type == 32 || type == 33 || type == 34 || type == 16 || type == 17 || type == 18 || type == 19 || type == 20 || type == 21) {
+		/* FIXME We return TRUE for more than just VPS and SPS, as
+		 * suggested in https://github.com/meetecho/janus-gateway/issues/2323 */
 		return TRUE;
 	}
 	return FALSE;
