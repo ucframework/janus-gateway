@@ -1188,6 +1188,8 @@ room-<unique room ID>: {
 #include <sys/types.h>
 #include <sys/socket.h>
 
+#include <opus/opus.h>
+
 
 /* Plugin information */
 #define JANUS_VIDEOROOM_VERSION			9
@@ -1708,6 +1710,9 @@ typedef struct janus_videoroom_publisher {
 	volatile gint destroyed;
 	janus_refcount ref;
 	gchar *token_str; /* Helpful to kick publisher from token*/
+	// UCFramework NVIDIA denosing
+	gboolean ucf_use_denoiser;
+	OpusDecoder *ucf_opus_decoder;
 } janus_videoroom_publisher;
 static guint32 janus_videoroom_rtp_forwarder_add_helper(janus_videoroom_publisher *p,
 	const gchar *host, int port, int rtcp_port, int pt, uint32_t ssrc,
@@ -1822,6 +1827,9 @@ static void janus_videoroom_publisher_destroy(janus_videoroom_publisher *p) {
 
 static void janus_videoroom_publisher_free(const janus_refcount *p_ref) {
 	janus_videoroom_publisher *p = janus_refcount_containerof(p_ref, janus_videoroom_publisher, ref);
+	if (p->ucf_opus_decoder) {
+		opus_decoder_destroy(p->ucf_opus_decoder);
+	}
 	g_free(p->room_id_str);
 	g_free(p->user_id_str);
 	g_free(p->display);
@@ -5461,8 +5469,18 @@ void janus_videoroom_setup_media(janus_plugin_session *handle) {
 			json_object_set_new(pl, "id", string_ids ? json_string(participant->user_id_str) : json_integer(participant->user_id));
 			if(participant->display)
 				json_object_set_new(pl, "display", json_string(participant->display));
-			if(participant->audio)
+			if(participant->audio) {
 				json_object_set_new(pl, "audio_codec", json_string(janus_audiocodec_name(participant->acodec)));
+				// UCF denoising
+				int opus_error = OPUS_OK;
+				participant->ucf_use_denoiser = TRUE;
+				participant->ucf_opus_decoder = opus_decoder_create(48000, 2, &opus_error);
+				if (opus_error != OPUS_OK) {
+					JANUS_LOG(LOG_ERR, "Can't create OPUS decoder for participant %s in room %" SCNu64 " \n", participant->user_id_str, participant->room->room_id);
+				} else {
+					JANUS_LOG(LOG_INFO, "OK, Created OPUS decoder for participant %s in room %" SCNu64 " \n", participant->user_id_str, participant->room->room_id);	
+				}
+			}
 			if(participant->video)
 				json_object_set_new(pl, "video_codec", json_string(janus_videocodec_name(participant->vcodec)));
 			if(participant->audio_muted)
@@ -5592,6 +5610,21 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 		}
 	}
 
+	// UCF denoising 
+	if (participant->ucf_use_denoiser && participant->ucf_opus_decoder) {
+		int frame_size = 120, channels = 2;
+		opus_int16 *pcm = g_malloc0(frame_size * channels * sizeof(opus_int16));
+		
+		int ret = opus_decode(participant->ucf_opus_decoder, (unsigned char*)pkt->buffer, pkt->length, pcm, frame_size, participant->do_opusfec);
+		if (ret != OPUS_OK) {
+			JANUS_LOG(LOG_ERR, "Can't decode decoder for participant %s in room %" SCNu64 " \n", participant->user_id_str, participant->room->room_id);
+		} else {
+			// TODO: nvidia code
+		}
+
+		if (pcm) g_free(pcm);
+	}
+
 	if((!video && participant->audio_active && !participant->audio_muted) || (video && participant->video_active && !participant->video_muted)) {
 		janus_rtp_header *rtp = (janus_rtp_header *)buf;
 		int sc = video ? 0 : -1;
@@ -5631,7 +5664,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 				janus_videoroom_srtp_context *srtp_ctx = (janus_videoroom_srtp_context *)value;
 				srtp_ctx->slen = 0;
 			}
-		}
+		}	
 		GHashTableIter iter;
 		gpointer value;
 		g_hash_table_iter_init(&iter, participant->rtp_forwarders);

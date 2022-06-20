@@ -706,7 +706,6 @@ AS_IF([test "x$enable_systemd_sockets" = "xyes"],
                           [AC_MSG_ERROR([libsystemd not found. systemd unix domain socket service not supported])])
       ])
 
-
 ##
 # Plugins
 ##
