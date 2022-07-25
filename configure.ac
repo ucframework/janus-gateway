@@ -214,6 +214,8 @@ AC_ARG_ENABLE([all-handlers],
               [
                AS_IF([test "x$enable_sample_event_handler" != "xyes"],
                      [enable_sample_event_handler=no])
+               AS_IF([test "x$enable_ucf_http_handler" != "xyes"],
+                     [enable_ucf_http_handler=no])
                AS_IF([test "x$enable_websockets_event_handler" != "xyes"],
                      [enable_websockets_event_handler=no])
                AS_IF([test "x$enable_rabbitmq_event_handler" != "xyes"],
@@ -295,6 +297,13 @@ AC_ARG_ENABLE([sample-event-handler],
               [AS_IF([test "x$enable_sample_event_handler" != "xyes"],
                      [enable_sample_event_handler=no])],
               [enable_sample_event_handler=maybe])
+
+AC_ARG_ENABLE([ucf-http-handler],
+              [AS_HELP_STRING([--disable-ucf-handler-handler],
+                              [Disable UC Framework http event handler (HTTP POST) ])],
+              [AS_IF([test "x$enable_ufc_http_handler" != "xyes"],
+                     [enable_ufc_http_handler=no])],
+              [enable_ufc_http_handler=maybe])
 
 AC_ARG_ENABLE([websockets-event-handler],
               [AS_HELP_STRING([--disable-websockets-event-handler],
@@ -484,6 +493,11 @@ PKG_CHECK_MODULES([LIBCURL],
                         AC_DEFINE(HAVE_SAMPLEEVH)
                         enable_sample_event_handler=yes
                       ])
+                    AS_IF([test "x$enable_ufc_http_handler" != "xno"],
+                      [
+                        AC_DEFINE(HAVE_UCF_HTTP)
+                        enable_ufc_http_handler=yes
+                      ])
                   ],
                   [
                     AS_IF([test "x$enable_turn_rest_api" = "xyes"],
@@ -493,6 +507,7 @@ PKG_CHECK_MODULES([LIBCURL],
                   ])
 AM_CONDITIONAL([ENABLE_TURN_REST_API], [test "x$enable_turn_rest_api" = "xyes"])
 AM_CONDITIONAL([ENABLE_SAMPLEEVH], [test "x$enable_sample_event_handler" = "xyes"])
+AM_CONDITIONAL([ENABLE_UCF_HTTP], [test "x$enable_ucf_http_handler" = "xyes"])
 
 AC_CHECK_PROG([DOXYGEN],
               [doxygen],
@@ -1086,6 +1101,9 @@ echo "Event handlers:"
 AM_COND_IF([ENABLE_SAMPLEEVH],
 	[echo "    Sample event handler:  yes"],
 	[echo "    Sample event handler:  no"])
+AM_COND_IF([ENABLE_UCF_HTTP],
+	[echo "    UCFHTTP event handler: yes"],
+	[echo "    UCFHTTP event handler: no"])
 AM_COND_IF([ENABLE_WSEVH],
 	[echo "    WebSocket ev. handler: yes"],
 	[echo "    WebSocket ev. handler: no"])
