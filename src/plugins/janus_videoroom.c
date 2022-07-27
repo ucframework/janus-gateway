@@ -1656,8 +1656,11 @@ static struct janus_json_parameter roomstr_parameters[] = {
 static struct janus_json_parameter roomstropt_parameters[] = {
 	{"room", JSON_STRING, 0}
 };
+static struct janus_json_parameter token_parameters[] = {
+	{"token", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
 static struct janus_json_parameter id_parameters[] = {
-	{"id", JSON_INTEGER, JANUS_JSON_PARAM_REQUIRED | JANUS_JSON_PARAM_POSITIVE}
+	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE}
 };
 static struct janus_json_parameter idopt_parameters[] = {
 	{"id", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE}
@@ -2193,6 +2196,7 @@ typedef struct janus_videoroom_publisher {
 	gboolean e2ee;		/* If media from this publisher is end-to-end encrypted */
 	volatile gint destroyed;
 	janus_refcount ref;
+	gchar *token_str; /* Helpful to kick publisher from token*/
 } janus_videoroom_publisher;
 /* Each VideoRoom publisher can share multiple streams, so each stream is its own structure */
 typedef struct janus_videoroom_publisher_stream {
@@ -2293,6 +2297,7 @@ typedef struct janus_videoroom_subscriber {
 	volatile gint answered, pending_offer, pending_restart, skipped_autoupdate;
 	volatile gint destroyed;
 	janus_refcount ref;
+	gchar *token_str; /* Helpful to kick subscriber from token*/
 } janus_videoroom_subscriber;
 /* Each VideoRoom subscriber can be subscribed to multiple streams, belonging to
  * the same or different publishers: as such, each stream is its own structure */
@@ -4294,6 +4299,73 @@ static void janus_videoroom_leave_or_unpublish(janus_videoroom_publisher *partic
 	janus_mutex_unlock(&room->mutex);
 	janus_refcount_decrease(&room->ref);
 	json_decref(event);
+}
+
+// Helper function to kick a participant from videoroom
+// Note: a ref to videoroom must exist prior to calling this function
+static int janus_videoroom_kick_participant_internal(janus_videoroom *videoroom, guint64 user_id, char *user_id_str, char *room_id_str, json_t *response, char *error_cause)
+{
+    int error_code = 0;
+    janus_mutex_lock(&videoroom->mutex);
+    janus_videoroom_publisher *participant = g_hash_table_lookup(videoroom->participants,
+        string_ids ? (gpointer)user_id_str : (gpointer)&user_id);
+    if(participant == NULL) {
+        janus_mutex_unlock(&videoroom->mutex);
+        JANUS_LOG(LOG_ERR, "No such user %s in room %s\n", user_id_str, room_id_str);
+        error_code = JANUS_VIDEOROOM_ERROR_NO_SUCH_FEED;
+        g_snprintf(error_cause, 512, "No such user %s in room %s", user_id_str, room_id_str);
+        return error_code;
+    }
+    janus_refcount_increase(&participant->ref);
+    if(participant->kicked) {
+        /* Already kicked */
+        janus_mutex_unlock(&videoroom->mutex);
+        janus_refcount_decrease(&participant->ref);
+        response = json_object();
+        json_object_set_new(response, "videoroom", json_string("success"));
+        /* Done */
+        return error_code;
+    }
+    participant->kicked = TRUE;
+    g_atomic_int_set(&participant->session->started, 0);
+    /* Prepare an event for this */
+    json_t *kicked = json_object();
+    json_object_set_new(kicked, "videoroom", json_string("event"));
+    json_object_set_new(kicked, "room", string_ids ? json_string(participant->room_id_str) : json_integer(participant->room_id));
+    json_object_set_new(kicked, "leaving", json_string("ok"));
+    json_object_set_new(kicked, "reason", json_string("kicked"));
+    int ret = gateway->push_event(participant->session->handle, &janus_videoroom_plugin, NULL, kicked, NULL);
+    JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
+    json_decref(kicked);
+    janus_mutex_unlock(&videoroom->mutex);
+    /* If this room requires valid private_id values, we can kick subscriptions too */
+    if(videoroom->require_pvtid && participant->subscriptions != NULL) {
+        /* Iterate on the subscriptions we know this user has */
+        janus_mutex_lock(&participant->own_subscriptions_mutex);
+        GSList *s = participant->subscriptions;
+        while(s) {
+            janus_videoroom_subscriber *subscriber = (janus_videoroom_subscriber *)s->data;
+            if(subscriber) {
+                subscriber->kicked = TRUE;
+                /* FIXME We should also close the PeerConnection, but we risk race conditions if we do it here,
+                    * so for now we mark the subscriber as kicked and prevent it from getting any media after this */
+            }
+            s = s->next;
+        }
+        janus_mutex_unlock(&participant->own_subscriptions_mutex);
+    }
+    /* This publisher is leaving, tell everybody */
+    janus_videoroom_leave_or_unpublish(participant, TRUE, TRUE);
+    /* Tell the core to tear down the PeerConnection, hangup_media will do the rest */
+    if(participant && !g_atomic_int_get(&participant->destroyed) && participant->session)
+        gateway->close_pc(participant->session->handle);
+    JANUS_LOG(LOG_INFO, "Kicked user %s from room %s\n", user_id_str, room_id_str);
+    /* Prepare response */
+    response = json_object();
+    json_object_set_new(response, "videoroom", json_string("success"));
+    /* Done */
+    janus_refcount_decrease(&participant->ref);
+    return error_code;
 }
 
 void janus_videoroom_destroy_session(janus_plugin_session *handle, int *error) {
@@ -6501,6 +6573,109 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 		/* Done */
 		janus_refcount_decrease(&videoroom->ref);
 		janus_refcount_decrease(&participant->ref);
+		goto prepare_response;
+	}  else if(!strcasecmp(request_text, "kickall")) {
+		JANUS_LOG(LOG_INFO, "Attempt to kick all participants with same token from an existing VideoRoom room\n");
+		if(!string_ids) {
+			JANUS_VALIDATE_JSON_OBJECT(root, room_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_VIDEOROOM_ERROR_MISSING_ELEMENT, JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT);
+		} else {
+			JANUS_VALIDATE_JSON_OBJECT(root, roomstr_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_VIDEOROOM_ERROR_MISSING_ELEMENT, JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT);
+		}
+		JANUS_VALIDATE_JSON_OBJECT(root, token_parameters,
+			error_code, error_cause, TRUE,
+			JANUS_VIDEOROOM_ERROR_MISSING_ELEMENT, JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT);
+		if(error_code != 0)
+			goto prepare_response;
+		guint64 room_id = 0;
+		json_t *room = json_object_get(root, "room");
+		json_t *token = json_object_get(root, "token");
+		char room_id_num[30], *room_id_str = NULL;
+		if(!string_ids) {
+			room_id = json_integer_value(room);
+			g_snprintf(room_id_num, sizeof(room_id_num), "%"SCNu64, room_id);
+			room_id_str = room_id_num;
+		} else {
+			room_id_str = (char *)json_string_value(room);
+		}
+		janus_mutex_lock(&rooms_mutex);
+		janus_videoroom *videoroom = NULL;
+		error_code = janus_videoroom_access_room(root, TRUE, FALSE, &videoroom, error_cause, sizeof(error_cause));
+		if(error_code != 0) {
+			janus_mutex_unlock(&rooms_mutex);
+			goto prepare_response;
+		}
+		janus_refcount_increase(&videoroom->ref);
+		janus_mutex_unlock(&rooms_mutex);
+		janus_mutex_lock(&videoroom->mutex);
+		/* A secret may be required for this action */
+		JANUS_CHECK_SECRET(videoroom->room_secret, root, "secret", error_code, error_cause,
+			JANUS_VIDEOROOM_ERROR_MISSING_ELEMENT, JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT, JANUS_VIDEOROOM_ERROR_UNAUTHORIZED);
+		if(error_code != 0) {
+			janus_mutex_unlock(&videoroom->mutex);
+			janus_refcount_decrease(&videoroom->ref);
+			goto prepare_response;
+		}
+		GHashTableIter iter;
+		gpointer key, value;
+		GList *participantsLeaving = NULL;
+		GList *potencialSubscribers = NULL;
+		g_hash_table_iter_init(&iter, videoroom->participants);
+		while (g_hash_table_iter_next (&iter, &key, &value))  {
+			janus_videoroom_publisher *participant = value;
+			
+			janus_refcount_increase(&participant->ref);
+			if (strcmp(participant->token_str, (char *)json_string_value(token)) != 0) {
+				potencialSubscribers = g_list_append(potencialSubscribers, participant); 
+			} else if (strcmp(participant->token_str, (char *)json_string_value(token)) == 0 && !participant->kicked) {
+				participantsLeaving = g_list_append(participantsLeaving, participant);
+			}
+		}
+		// Also remove it from the allowed list
+		g_hash_table_remove(videoroom->allowed, (char *)json_string_value(token));
+		janus_mutex_unlock(&videoroom->mutex);
+		for(GList *i = potencialSubscribers; i; i = i->next) {
+			janus_videoroom_publisher *participant = i->data;
+			janus_mutex_lock(&participant->streams_mutex);
+			GList *publisher_stream_iter = participant->streams;
+			while (publisher_stream_iter) {
+				janus_videoroom_publisher_stream *stream = publisher_stream_iter->data;
+				janus_mutex_lock(&stream->subscribers_mutex);
+				/* Iterate on the subscriptions we know this user has */
+				GSList *s = stream->subscribers;
+				while(s) {
+					janus_videoroom_subscriber *subscriber = (janus_videoroom_subscriber *)s->data;
+					if(subscriber && subscriber->token_str && !strcmp(subscriber->token_str, (char *)json_string_value(token))) {
+						if(!subscriber->kicked) {
+							JANUS_LOG(LOG_INFO, "[kickall] Kicked subscriber by token %s from room %s\n", subscriber->token_str, room_id_str);
+							g_atomic_int_set(&subscriber->session->started, 0);
+							subscriber->kicked = TRUE;
+						}
+					}
+					s = s->next;
+				}
+				janus_mutex_unlock(&stream->subscribers_mutex);
+				publisher_stream_iter = publisher_stream_iter->next; 
+			}
+			janus_mutex_unlock(&participant->streams_mutex);
+			janus_refcount_decrease(&participant->ref);
+		}
+		for(GList *i = participantsLeaving; i; i = i->next) {
+			json_t *resp = NULL;
+			janus_videoroom_publisher *participant = i->data;
+			JANUS_LOG(LOG_INFO, "[kickall] kick participant %"SCNu64 ", %s\n", participant->user_id, participant->user_id_str ? participant->user_id_str : "null");
+			error_code = janus_videoroom_kick_participant_internal(videoroom, participant->user_id, participant->user_id_str, participant->room_id_str, resp, error_cause);
+			if (resp) json_decref(resp);
+			janus_refcount_decrease(&participant->ref);
+		}
+		janus_refcount_decrease(&videoroom->ref);
+		g_list_free(participantsLeaving);
+		/* Prepare response */
+		response = json_object();
+		json_object_set_new(response, "videoroom", json_string("success"));
 		goto prepare_response;
 	} else if(!strcasecmp(request_text, "moderate")) {
 		JANUS_LOG(LOG_VERB, "Attempt to moderate a participant as a moderator in an existing VideoRoom room\n");
@@ -9157,6 +9332,7 @@ static void *janus_videoroom_handler(void *data) {
 			janus_mutex_lock(&videoroom->mutex);
 			json_t *ptype = json_object_get(root, "ptype");
 			const char *ptype_text = json_string_value(ptype);
+			char *token_publisher_str = NULL;
 			if(!strcasecmp(ptype_text, "publisher")) {
 				JANUS_LOG(LOG_VERB, "Configuring new publisher\n");
 				JANUS_VALIDATE_JSON_OBJECT(root, publisher_parameters,
@@ -9208,6 +9384,13 @@ static void *janus_videoroom_handler(void *data) {
 						error_code = JANUS_VIDEOROOM_ERROR_UNAUTHORIZED;
 						g_snprintf(error_cause, 512, "Unauthorized (not in the allowed list)");
 						goto error;
+					}
+					token_publisher_str = strdup(token_text);
+				} else {
+					json_t *token = json_object_get(root, "token");
+					const char *token_text = token ? json_string_value(token) : NULL;
+					if (token_text) {
+						token_publisher_str = strdup(token_text);
 					}
 				}
 				json_t *display = json_object_get(root, "display");
@@ -9279,6 +9462,10 @@ static void *janus_videoroom_handler(void *data) {
 				user_audio_active_packets = json_object_get(root, "audio_active_packets");
 				user_audio_level_average = json_object_get(root, "audio_level_average");
 				janus_videoroom_publisher *publisher = g_malloc0(sizeof(janus_videoroom_publisher));
+				publisher->token_str = token_publisher_str ? token_publisher_str : NULL;
+				if (!publisher->token_str) {
+					JANUS_LOG(LOG_WARN, "Creating publisher with null token\n");
+				}
 				publisher->session = session;
 				publisher->room_id = videoroom->room_id;
 				publisher->room_id_str = videoroom->room_id_str ? g_strdup(videoroom->room_id_str) : NULL;
@@ -9785,6 +9972,13 @@ static void *janus_videoroom_handler(void *data) {
 				janus_mutex_unlock(&videoroom->mutex);
 				/* Allocate a new subscriber instance */
 				janus_videoroom_subscriber *subscriber = g_malloc0(sizeof(janus_videoroom_subscriber));
+				json_t *token = json_object_get(root, "token");
+				const char *token_text = token ? json_string_value(token) : NULL;
+				if (token_text) {
+					subscriber->token_str = strdup(token_text);
+				} else {
+					JANUS_LOG(LOG_WARN, "Did not received token for subscriber\n");
+				}
 				subscriber->session = session;
 				subscriber->room_id = videoroom->room_id;
 				subscriber->room_id_str = videoroom->room_id_str ? g_strdup(videoroom->room_id_str) : NULL;
