@@ -884,7 +884,17 @@ room-<unique room ID>: {
 }
 \endverbatim
  *
- * All the participants will receive an \c event notification with the
+ * The leaving user will receive a \c left notification:
+ *
+\verbatim
+{
+	"audiobridge" : "left",
+	"room" : <numeric ID of the room>,
+	"id" : <numeric ID of the participant who left>
+}
+\endverbatim
+ *
+ * All the other participants will receive an \c event notification with the
  * ID of the participant who just left:
  *
 \verbatim
@@ -5630,6 +5640,7 @@ void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, janus_plugin_r
 			} else if(participant->codec == JANUS_AUDIOCODEC_PCMA || participant->codec == JANUS_AUDIOCODEC_PCMU) {
 				/* G.711 */
 				if(plen != 160) {
+					g_atomic_int_set(&participant->decoding, 0);
 					JANUS_LOG(LOG_WARN, "[G.711] Wrong packet size (expected 160, got %d), skipping audio packet\n", plen);
 					g_free(pkt->data);
 					g_free(pkt);
@@ -5873,8 +5884,8 @@ static void janus_audiobridge_hangup_media_internal(janus_plugin_session *handle
 	janus_audiobridge_room *audiobridge = participant->room;
 	gboolean removed = FALSE;
 	if(audiobridge != NULL) {
-		participant->room = NULL;
 		janus_mutex_lock(&audiobridge->mutex);
+		participant->room = NULL;
 		json_t *event = json_object();
 		json_object_set_new(event, "audiobridge", json_string("event"));
 		json_object_set_new(event, "room",
@@ -6403,6 +6414,7 @@ static void *janus_audiobridge_handler(void *data) {
 			participant->reset = FALSE;
 			/* If this is a plain RTP participant, create the socket */
 			if(rtp != NULL) {
+				gen_offer = NULL;
 				const char *ip = json_string_value(json_object_get(rtp, "ip"));
 				uint16_t port = json_integer_value(json_object_get(rtp, "port"));
 				if(participant->codec == JANUS_AUDIOCODEC_OPUS) {
@@ -8479,6 +8491,8 @@ static void *janus_audiobridge_participant_thread(void *data) {
 					janus_audiobridge_relay_rtp_packet(participant->session, outpkt);
 				}
 			}
+		}
+		if(mixedpkt) {
 			g_free(mixedpkt->data);
 			g_free(mixedpkt);
 		}

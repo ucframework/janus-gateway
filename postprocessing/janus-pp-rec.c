@@ -213,7 +213,7 @@ static char *janus_pp_extensions_string(const char **allowed, char *supported, s
 	janus_strlcat(supported, "[", suplen);
 	const char **ext = allowed;
 	while(*ext != NULL) {
-		if(strlen(supported) > 1)
+		if(strnlen(supported, 1 + 1) > 1)
 			janus_strlcat(supported, ", ", suplen);
 		janus_strlcat(supported, *ext, suplen);
 		ext++;
@@ -476,6 +476,11 @@ int main(int argc, char *argv[])
 		if(bytes != 8 || prebuffer[0] != 'M') {
 			JANUS_LOG(LOG_WARN, "Invalid header at offset %ld (%s), the processing will stop here...\n",
 				offset, bytes != 8 ? "not enough bytes" : "wrong prefix");
+			if(!parsed_header) {
+				/* Not an MJR file? */
+				cmdline_parser_free(&args_info);
+				exit(1);
+			}
 			break;
 		}
 		if(prebuffer[1] == 'E') {
